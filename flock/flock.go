@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"syscall"
 )
 
@@ -15,9 +14,7 @@ var (
 )
 
 type flocker struct {
-	mu     sync.Mutex
-	file   *os.File
-	flockT *syscall.Flock_t
+	file *os.File
 }
 
 func New(path string) (*flocker, error) {
@@ -35,50 +32,49 @@ func New(path string) (*flocker, error) {
 }
 
 func (l *flocker) Lock() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.flock()
+	err := l.lock()
+	if err != nil {
+		l.unlock()
+	}
+	return err
 }
 
 func (l *flocker) Unlock() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.funlock()
+	l.unlock()
+	return l.file.Close()
 }
 
-func (l *flocker) flock() error {
-	if l.flockT != nil {
-		return ErrLocked
-	}
-
-	l.flockT = &syscall.Flock_t{
-		Type:   syscall.F_WRLCK, // F_WRLCK is for write lock on a file
-		Whence: io.SeekStart,
-		Start:  0,
-		Len:    0,
-	}
-	return syscallFcntlFlock(l)
+func (l *flocker) lock() error {
+	return syscallFcntlFlock(l.file, syscall.F_WRLCK)
 }
 
-func (l *flocker) funlock() error {
-	if l.flockT == nil {
-		return ErrUnlocked
-	}
-
-	// F_UNLCK is for release lock
-	l.flockT.Type = syscall.F_UNLCK
-
-	err := syscallFcntlFlock(l)
-	if err == nil {
-		l.flockT = nil
-	}
-	return err
+func (l *flocker) unlock() error {
+	return syscallFcntlFlock(l.file, syscall.F_UNLCK)
 }
 
 func (l *flocker) String() string {
 	return fmt.Sprintf("<flocker(%s)>", l.file.Name())
 }
 
-func syscallFcntlFlock(l *flocker) error {
-	return syscall.FcntlFlock(l.file.Fd(), syscall.F_SETLK, l.flockT)
+// Note, POSIX locks apply per inode and process.
+// The lock for an inode is released when *any* descriptor for that inode is closed.
+// - http://0pointer.de/blog/projects/locking.html
+// - https://github.com/golang/go/blob/release-branch.go1.12/src/cmd/go/internal/lockedfile/internal/filelock/filelock_fcntl.go
+// For the use case described in adjust/backend#8158 this is fine.
+func syscallFcntlFlock(file *os.File, lt int16) error {
+	err := syscall.FcntlFlock(
+		file.Fd(),
+		//syscall.F_SETLK, // non-blocking, e.g. return EAGAIN error if lock is already held
+		syscall.F_SETLKW, // blocking
+		&syscall.Flock_t{
+			Type:   lt,
+			Whence: io.SeekStart,
+			Start:  0,
+			Len:    0,
+		},
+	)
+	if err == syscall.EAGAIN {
+		return ErrLocked
+	}
+	return err
 }
